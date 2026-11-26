@@ -1,0 +1,78 @@
+name: Windows iptable E2E (manual test)
+
+on:
+  push:
+    branches:
+      - test/windows-iptable-e2e
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.17.1'
+
+      # Same commands as client:windows:build-helpers in client/Taskfile.yml (#2981).
+      - name: Build OutlineService.exe and smartdnsblock.exe from source
+        shell: pwsh
+        working-directory: client/electron/windows
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "$env:RUNNER_TEMP\helpers"
+          dotnet build OutlineService/OutlineService/OutlineService.csproj --configuration Release -p:Platform=x86 --no-incremental --output $out "-p:BaseIntermediateOutputPath=$out/obj/"
+          if ($LASTEXITCODE -ne 0) { throw "dotnet build failed" }
+          zig c++ -target x86-windows-gnu -Os -s smartdnsblock/smartdnsblock/smartdnsblock.cpp -liphlpapi -lfwpuclnt -lrpcrt4 -o "$out\smartdnsblock.exe"
+          if ($LASTEXITCODE -ne 0) { throw "zig build failed" }
+
+      - name: Build tun2socks.exe
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+        run: go build -trimpath -o "$env:RUNNER_TEMP\outline\tun2socks.exe" ./client/go/outline/electron
+
+      - name: Install TAP device and OutlineService
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = "$env:RUNNER_TEMP\outline"
+          Copy-Item third_party\tap-windows6\bin\amd64 "$inst\tap-windows6" -Recurse
+          Copy-Item client\electron\add_tap_device.bat, client\electron\find_tap_device_name.bat, client\electron\install_windows_service.bat $inst
+          Copy-Item "$env:RUNNER_TEMP\helpers\OutlineService.exe", "$env:RUNNER_TEMP\helpers\smartdnsblock.exe" $inst
+          Copy-Item third_party\newtonsoft\Newtonsoft.Json.dll $inst
+
+          # Trust the TAP driver publisher so devcon installs without a prompt.
+          $cert = (Get-AuthenticodeSignature "$inst\tap-windows6\tap0901.cat").SignerCertificate
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher', 'LocalMachine')
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+
+          Push-Location $inst
+          cmd /c add_tap_device.bat
+          if ($LASTEXITCODE -ne 0) { throw "add_tap_device.bat failed: $LASTEXITCODE" }
+          cmd /c install_windows_service.bat
+          Pop-Location
+          sc.exe query OutlineService
+          Get-NetAdapter | Format-Table Name, InterfaceIndex, Status, InterfaceDescription
+          Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | Format-Table
+
+      - name: Run E2E
+        shell: pwsh
+        env:
+          TEST_SS_KEY: ${{ secrets.TEST_SS_KEY }}
+        run: node .github/win_e2e/e2e.mjs "$env:RUNNER_TEMP\outline\tun2socks.exe"
+
+      - name: OutlineService event log
+        if: always()
+        shell: pwsh
+        run: Get-EventLog -LogName Application -Source OutlineService -Newest 40 -ErrorAction SilentlyContinue | Sort-Object TimeGenerated | Format-Table TimeGenerated, EntryType, Message -AutoSize -Wrap
